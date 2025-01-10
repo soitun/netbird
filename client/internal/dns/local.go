@@ -2,20 +2,39 @@ package dns
 
 import (
 	"fmt"
-	"github.com/miekg/dns"
-	nbdns "github.com/netbirdio/netbird/dns"
-	log "github.com/sirupsen/logrus"
 	"sync"
+
+	"github.com/miekg/dns"
+	log "github.com/sirupsen/logrus"
+
+	nbdns "github.com/netbirdio/netbird/dns"
 )
+
+type registrationMap map[string]struct{}
 
 type localResolver struct {
 	registeredMap registrationMap
 	records       sync.Map
 }
 
+func (d *localResolver) MatchSubdomains() bool {
+	return true
+}
+
+func (d *localResolver) stop() {
+}
+
+// String returns a string representation of the local resolver
+func (d *localResolver) String() string {
+	return fmt.Sprintf("local resolver [%d records]", len(d.registeredMap))
+}
+
 // ServeDNS handles a DNS request
 func (d *localResolver) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	log.Tracef("received question: %#v\n", r.Question[0])
+	if len(r.Question) > 0 {
+		log.Tracef("received question: domain=%s type=%v class=%v", r.Question[0].Name, r.Question[0].Qtype, r.Question[0].Qclass)
+	}
+
 	replyMessage := &dns.Msg{}
 	replyMessage.SetReply(r)
 	replyMessage.RecursionAvailable = true
@@ -24,6 +43,8 @@ func (d *localResolver) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	response := d.lookupRecord(r)
 	if response != nil {
 		replyMessage.Answer = append(replyMessage.Answer, response)
+	} else {
+		replyMessage.Rcode = dns.RcodeNameError
 	}
 
 	err := w.WriteMsg(replyMessage)
@@ -45,7 +66,7 @@ func (d *localResolver) lookupRecord(r *dns.Msg) dns.RR {
 func (d *localResolver) registerRecord(record nbdns.SimpleRecord) error {
 	fullRecord, err := dns.NewRR(record.String())
 	if err != nil {
-		return err
+		return fmt.Errorf("register record: %w", err)
 	}
 
 	fullRecord.Header().Rdlength = record.Len()
@@ -64,3 +85,5 @@ func buildRecordKey(name string, class, qType uint16) string {
 	key := fmt.Sprintf("%s_%d_%d", name, class, qType)
 	return key
 }
+
+func (d *localResolver) probeAvailability() {}

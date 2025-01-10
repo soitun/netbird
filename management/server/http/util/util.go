@@ -1,22 +1,35 @@
 package util
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/netbirdio/netbird/management/server/status"
-	log "github.com/sirupsen/logrus"
 	"net/http"
+	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/management/server/status"
 )
 
-// WriteJSONObject simply writes object to the HTTP reponse in JSON format
-func WriteJSONObject(w http.ResponseWriter, obj interface{}) {
-	w.WriteHeader(http.StatusOK)
+// EmptyObject is an empty struct used to return empty JSON object
+type EmptyObject struct {
+}
+
+type ErrorResponse struct {
+	Message string `json:"message"`
+	Code    int    `json:"code"`
+}
+
+// WriteJSONObject simply writes object to the HTTP response in JSON format
+func WriteJSONObject(ctx context.Context, w http.ResponseWriter, obj interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
 	err := json.NewEncoder(w).Encode(obj)
 	if err != nil {
-		WriteError(err, w)
+		WriteError(ctx, err, w)
 		return
 	}
 }
@@ -55,14 +68,9 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // WriteErrorResponse prepares and writes an error response i nJSON
 func WriteErrorResponse(errMsg string, httpStatus int, w http.ResponseWriter) {
-	type errorResponse struct {
-		Message string `json:"message"`
-		Code    int    `json:"code"`
-	}
-
-	w.WriteHeader(httpStatus)
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-	err := json.NewEncoder(w).Encode(&errorResponse{
+	w.WriteHeader(httpStatus)
+	err := json.NewEncoder(w).Encode(&ErrorResponse{
 		Message: errMsg,
 		Code:    httpStatus,
 	})
@@ -73,7 +81,8 @@ func WriteErrorResponse(errMsg string, httpStatus int, w http.ResponseWriter) {
 
 // WriteError converts an error to an JSON error response.
 // If it is known internal error of type server.Error then it sets the messages from the error, a generic message otherwise
-func WriteError(err error, w http.ResponseWriter) {
+func WriteError(ctx context.Context, err error, w http.ResponseWriter) {
+	log.WithContext(ctx).Errorf("got a handler error: %s", err.Error())
 	errStatus, ok := status.FromError(err)
 	httpStatus := http.StatusInternalServerError
 	msg := "internal server error"
@@ -93,12 +102,16 @@ func WriteError(err error, w http.ResponseWriter) {
 			httpStatus = http.StatusInternalServerError
 		case status.InvalidArgument:
 			httpStatus = http.StatusUnprocessableEntity
+		case status.Unauthorized:
+			httpStatus = http.StatusUnauthorized
+		case status.BadRequest:
+			httpStatus = http.StatusBadRequest
 		default:
 		}
-		msg = err.Error()
+		msg = strings.ToLower(err.Error())
 	} else {
 		unhandledMSG := fmt.Sprintf("got unhandled error code, error: %s", err.Error())
-		log.Error(unhandledMSG)
+		log.WithContext(ctx).Error(unhandledMSG)
 	}
 
 	WriteErrorResponse(msg, httpStatus, w)

@@ -2,70 +2,90 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
-	"google.golang.org/grpc/codes"
-	gstatus "google.golang.org/grpc/status"
 	"io"
+	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	gstatus "google.golang.org/grpc/status"
+
 	"github.com/cenkalti/backoff/v4"
-	"github.com/netbirdio/netbird/client/system"
-	"github.com/netbirdio/netbird/encryption"
-	"github.com/netbirdio/netbird/management/proto"
 	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
+
+	"github.com/netbirdio/netbird/client/system"
+	"github.com/netbirdio/netbird/encryption"
+	"github.com/netbirdio/netbird/management/proto"
+	nbgrpc "github.com/netbirdio/netbird/util/grpc"
 )
 
+const ConnectTimeout = 10 * time.Second
+
+const (
+	errMsgMgmtPublicKey    = "failed getting Management Service public key: %s"
+	errMsgNoMgmtConnection = "no connection to management"
+)
+
+// ConnStateNotifier is a wrapper interface of the status recorders
+type ConnStateNotifier interface {
+	MarkManagementDisconnected(error)
+	MarkManagementConnected()
+}
+
 type GrpcClient struct {
-	key        wgtypes.Key
-	realClient proto.ManagementServiceClient
-	ctx        context.Context
-	conn       *grpc.ClientConn
+	key                   wgtypes.Key
+	realClient            proto.ManagementServiceClient
+	ctx                   context.Context
+	conn                  *grpc.ClientConn
+	connStateCallback     ConnStateNotifier
+	connStateCallbackLock sync.RWMutex
 }
 
 // NewClient creates a new client to Management service
 func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
-	transportOption := grpc.WithTransportCredentials(insecure.NewCredentials())
+	var conn *grpc.ClientConn
 
-	if tlsEnabled {
-		transportOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{}))
+	operation := func() error {
+		var err error
+		conn, err = nbgrpc.CreateConnection(addr, tlsEnabled)
+		if err != nil {
+			log.Printf("createConnection error: %v", err)
+			return err
+		}
+		return nil
 	}
 
-	mgmCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(
-		mgmCtx,
-		addr,
-		transportOption,
-		grpc.WithBlock(),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:    15 * time.Second,
-			Timeout: 10 * time.Second,
-		}))
+	err := backoff.Retry(operation, nbgrpc.Backoff(ctx))
 	if err != nil {
-		log.Errorf("failed creating connection to Management Service %v", err)
+		log.Errorf("failed creating connection to Management Service: %v", err)
 		return nil, err
 	}
 
 	realClient := proto.NewManagementServiceClient(conn)
 
 	return &GrpcClient{
-		key:        ourPrivateKey,
-		realClient: realClient,
-		ctx:        ctx,
-		conn:       conn,
+		key:                   ourPrivateKey,
+		realClient:            realClient,
+		ctx:                   ctx,
+		conn:                  conn,
+		connStateCallbackLock: sync.RWMutex{},
 	}, nil
 }
 
 // Close closes connection to the Management Service
 func (c *GrpcClient) Close() error {
 	return c.conn.Close()
+}
+
+// SetConnStateListener set the ConnStateNotifier
+func (c *GrpcClient) SetConnStateListener(notifier ConnStateNotifier) {
+	c.connStateCallbackLock.Lock()
+	defer c.connStateCallbackLock.Unlock()
+	c.connStateCallback = notifier
 }
 
 // defaultBackoff is a basic backoff mechanism for general issues
@@ -89,66 +109,117 @@ func (c *GrpcClient) ready() bool {
 
 // Sync wraps the real client's Sync endpoint call and takes care of retries and encryption/decryption of messages
 // Blocking request. The result will be sent via msgHandler callback function
-func (c *GrpcClient) Sync(msgHandler func(msg *proto.SyncResponse) error) error {
-	backOff := defaultBackoff(c.ctx)
-
+func (c *GrpcClient) Sync(ctx context.Context, sysInfo *system.Info, msgHandler func(msg *proto.SyncResponse) error) error {
 	operation := func() error {
 		log.Debugf("management connection state %v", c.conn.GetState())
-
 		connState := c.conn.GetState()
+
 		if connState == connectivity.Shutdown {
 			return backoff.Permanent(fmt.Errorf("connection to management has been shut down"))
 		} else if !(connState == connectivity.Ready || connState == connectivity.Idle) {
-			c.conn.WaitForStateChange(c.ctx, connState)
+			c.conn.WaitForStateChange(ctx, connState)
 			return fmt.Errorf("connection to management is not ready and in %s state", connState)
 		}
 
 		serverPubKey, err := c.GetServerPublicKey()
 		if err != nil {
-			log.Debugf("failed getting Management Service public key: %s", err)
+			log.Debugf(errMsgMgmtPublicKey, err)
 			return err
 		}
 
-		ctx, cancelStream := context.WithCancel(c.ctx)
-		defer cancelStream()
-		stream, err := c.connectToStream(ctx, *serverPubKey)
-		if err != nil {
-			log.Debugf("failed to open Management Service stream: %s", err)
-			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.PermissionDenied {
-				return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
-			}
-			return err
+		return c.handleStream(ctx, *serverPubKey, sysInfo, msgHandler)
+	}
+
+	err := backoff.Retry(operation, defaultBackoff(ctx))
+	if err != nil {
+		log.Warnf("exiting the Management service connection retry loop due to the unrecoverable error: %s", err)
+	}
+
+	return err
+}
+
+func (c *GrpcClient) handleStream(ctx context.Context, serverPubKey wgtypes.Key, sysInfo *system.Info,
+	msgHandler func(msg *proto.SyncResponse) error) error {
+	ctx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	stream, err := c.connectToStream(ctx, serverPubKey, sysInfo)
+	if err != nil {
+		log.Debugf("failed to open Management Service stream: %s", err)
+		if s, ok := gstatus.FromError(err); ok && s.Code() == codes.PermissionDenied {
+			return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
 		}
+		return err
+	}
 
-		log.Infof("connected to the Management Service stream")
+	log.Infof("connected to the Management Service stream")
+	c.notifyConnected()
 
-		// blocking until error
-		err = c.receiveEvents(stream, *serverPubKey, msgHandler)
-		if err != nil {
-			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.PermissionDenied {
-				return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
-			}
-			// we need this reset because after a successful connection and a consequent error, backoff lib doesn't
-			// reset times and next try will start with a long delay
-			backOff.Reset()
+	// blocking until error
+	err = c.receiveEvents(stream, serverPubKey, msgHandler)
+	if err != nil {
+		s, _ := gstatus.FromError(err)
+		switch s.Code() {
+		case codes.PermissionDenied:
+			return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
+		case codes.Canceled:
+			log.Debugf("management connection context has been canceled, this usually indicates shutdown")
+			return nil
+		default:
+			c.notifyDisconnected(err)
 			log.Warnf("disconnected from the Management service but will retry silently. Reason: %v", err)
 			return err
 		}
-
-		return nil
-	}
-
-	err := backoff.Retry(operation, backOff)
-	if err != nil {
-		log.Warnf("exiting the Management service connection retry loop due to the unrecoverable error: %s", err)
-		return err
 	}
 
 	return nil
 }
 
-func (c *GrpcClient) connectToStream(ctx context.Context, serverPubKey wgtypes.Key) (proto.ManagementService_SyncClient, error) {
-	req := &proto.SyncRequest{}
+// GetNetworkMap return with the network map
+func (c *GrpcClient) GetNetworkMap(sysInfo *system.Info) (*proto.NetworkMap, error) {
+	serverPubKey, err := c.GetServerPublicKey()
+	if err != nil {
+		log.Debugf("failed getting Management Service public key: %s", err)
+		return nil, err
+	}
+
+	ctx, cancelStream := context.WithCancel(c.ctx)
+	defer cancelStream()
+	stream, err := c.connectToStream(ctx, *serverPubKey, sysInfo)
+	if err != nil {
+		log.Debugf("failed to open Management Service stream: %s", err)
+		return nil, err
+	}
+	defer func() {
+		_ = stream.CloseSend()
+	}()
+
+	update, err := stream.Recv()
+	if err == io.EOF {
+		log.Debugf("Management stream has been closed by server: %s", err)
+		return nil, err
+	}
+	if err != nil {
+		log.Debugf("disconnected from Management Service sync stream: %v", err)
+		return nil, err
+	}
+
+	decryptedResp := &proto.SyncResponse{}
+	err = encryption.DecryptMessage(*serverPubKey, c.key, update.Body, decryptedResp)
+	if err != nil {
+		log.Errorf("failed decrypting update message from Management Service: %s", err)
+		return nil, err
+	}
+
+	if decryptedResp.GetNetworkMap() == nil {
+		return nil, fmt.Errorf("invalid msg, required network map")
+	}
+
+	return decryptedResp.GetNetworkMap(), nil
+}
+
+func (c *GrpcClient) connectToStream(ctx context.Context, serverPubKey wgtypes.Key, sysInfo *system.Info) (proto.ManagementService_SyncClient, error) {
+	req := &proto.SyncRequest{Meta: infoToMetaData(sysInfo)}
 
 	myPrivateKey := c.key
 	myPublicKey := myPrivateKey.PublicKey()
@@ -197,14 +268,15 @@ func (c *GrpcClient) receiveEvents(stream proto.ManagementService_SyncClient, se
 // GetServerPublicKey returns server's WireGuard public key (used later for encrypting messages sent to the server)
 func (c *GrpcClient) GetServerPublicKey() (*wgtypes.Key, error) {
 	if !c.ready() {
-		return nil, fmt.Errorf("no connection to management")
+		return nil, errors.New(errMsgNoMgmtConnection)
 	}
 
 	mgmCtx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
 	defer cancel()
 	resp, err := c.realClient.GetServerKey(mgmCtx, &proto.Empty{})
 	if err != nil {
-		return nil, err
+		log.Errorf("failed while getting Management Service public key: %v", err)
+		return nil, fmt.Errorf("failed while getting Management Service public key")
 	}
 
 	serverKey, err := wgtypes.ParseKey(resp.Key)
@@ -215,29 +287,74 @@ func (c *GrpcClient) GetServerPublicKey() (*wgtypes.Key, error) {
 	return &serverKey, nil
 }
 
+// IsHealthy probes the gRPC connection and returns false on errors
+func (c *GrpcClient) IsHealthy() bool {
+	switch c.conn.GetState() {
+	case connectivity.TransientFailure:
+		return false
+	case connectivity.Connecting:
+		return true
+	case connectivity.Shutdown:
+		return true
+	case connectivity.Idle:
+	case connectivity.Ready:
+	}
+
+	ctx, cancel := context.WithTimeout(c.ctx, 1*time.Second)
+	defer cancel()
+
+	_, err := c.realClient.GetServerKey(ctx, &proto.Empty{})
+	if err != nil {
+		c.notifyDisconnected(err)
+		log.Warnf("health check returned: %s", err)
+		return false
+	}
+	c.notifyConnected()
+	return true
+}
+
 func (c *GrpcClient) login(serverKey wgtypes.Key, req *proto.LoginRequest) (*proto.LoginResponse, error) {
 	if !c.ready() {
-		return nil, fmt.Errorf("no connection to management")
+		return nil, errors.New(errMsgNoMgmtConnection)
 	}
+
 	loginReq, err := encryption.EncryptMessage(serverKey, c.key, req)
 	if err != nil {
 		log.Errorf("failed to encrypt message: %s", err)
 		return nil, err
 	}
-	mgmCtx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
-	defer cancel()
-	resp, err := c.realClient.Login(mgmCtx, &proto.EncryptedMessage{
-		WgPubKey: c.key.PublicKey().String(),
-		Body:     loginReq,
-	})
+
+	var resp *proto.EncryptedMessage
+	operation := func() error {
+		mgmCtx, cancel := context.WithTimeout(context.Background(), ConnectTimeout)
+		defer cancel()
+
+		var err error
+		resp, err = c.realClient.Login(mgmCtx, &proto.EncryptedMessage{
+			WgPubKey: c.key.PublicKey().String(),
+			Body:     loginReq,
+		})
+		if err != nil {
+			// retry only on context canceled
+			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.Canceled {
+				return err
+			}
+			return backoff.Permanent(err)
+		}
+
+		return nil
+	}
+
+	err = backoff.Retry(operation, nbgrpc.Backoff(c.ctx))
 	if err != nil {
+		log.Errorf("failed to login to Management Service: %v", err)
 		return nil, err
 	}
 
 	loginResp := &proto.LoginResponse{}
 	err = encryption.DecryptMessage(serverKey, c.key, resp.Body, loginResp)
 	if err != nil {
-		log.Errorf("failed to decrypt registration message: %s", err)
+		log.Errorf("failed to decrypt login response: %s", err)
 		return nil, err
 	}
 
@@ -298,18 +415,130 @@ func (c *GrpcClient) GetDeviceAuthorizationFlow(serverKey wgtypes.Key) (*proto.D
 	return flowInfoResp, nil
 }
 
+// GetPKCEAuthorizationFlow returns a pkce authorization flow information.
+// It also takes care of encrypting and decrypting messages.
+func (c *GrpcClient) GetPKCEAuthorizationFlow(serverKey wgtypes.Key) (*proto.PKCEAuthorizationFlow, error) {
+	if !c.ready() {
+		return nil, fmt.Errorf("no connection to management in order to get pkce authorization flow")
+	}
+	mgmCtx, cancel := context.WithTimeout(c.ctx, time.Second*2)
+	defer cancel()
+
+	message := &proto.PKCEAuthorizationFlowRequest{}
+	encryptedMSG, err := encryption.EncryptMessage(serverKey, c.key, message)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.realClient.GetPKCEAuthorizationFlow(mgmCtx, &proto.EncryptedMessage{
+		WgPubKey: c.key.PublicKey().String(),
+		Body:     encryptedMSG,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	flowInfoResp := &proto.PKCEAuthorizationFlow{}
+	err = encryption.DecryptMessage(serverKey, c.key, resp.Body, flowInfoResp)
+	if err != nil {
+		errWithMSG := fmt.Errorf("failed to decrypt pkce authorization flow message: %s", err)
+		log.Error(errWithMSG)
+		return nil, errWithMSG
+	}
+
+	return flowInfoResp, nil
+}
+
+// SyncMeta sends updated system metadata to the Management Service.
+// It should be used if there is changes on peer posture check after initial sync.
+func (c *GrpcClient) SyncMeta(sysInfo *system.Info) error {
+	if !c.ready() {
+		return errors.New(errMsgNoMgmtConnection)
+	}
+
+	serverPubKey, err := c.GetServerPublicKey()
+	if err != nil {
+		log.Debugf(errMsgMgmtPublicKey, err)
+		return err
+	}
+
+	syncMetaReq, err := encryption.EncryptMessage(*serverPubKey, c.key, &proto.SyncMetaRequest{Meta: infoToMetaData(sysInfo)})
+	if err != nil {
+		log.Errorf("failed to encrypt message: %s", err)
+		return err
+	}
+
+	mgmCtx, cancel := context.WithTimeout(c.ctx, ConnectTimeout)
+	defer cancel()
+
+	_, err = c.realClient.SyncMeta(mgmCtx, &proto.EncryptedMessage{
+		WgPubKey: c.key.PublicKey().String(),
+		Body:     syncMetaReq,
+	})
+	return err
+}
+
+func (c *GrpcClient) notifyDisconnected(err error) {
+	c.connStateCallbackLock.RLock()
+	defer c.connStateCallbackLock.RUnlock()
+
+	if c.connStateCallback == nil {
+		return
+	}
+	c.connStateCallback.MarkManagementDisconnected(err)
+}
+
+func (c *GrpcClient) notifyConnected() {
+	c.connStateCallbackLock.RLock()
+	defer c.connStateCallbackLock.RUnlock()
+
+	if c.connStateCallback == nil {
+		return
+	}
+	c.connStateCallback.MarkManagementConnected()
+}
+
 func infoToMetaData(info *system.Info) *proto.PeerSystemMeta {
 	if info == nil {
 		return nil
 	}
+
+	addresses := make([]*proto.NetworkAddress, 0, len(info.NetworkAddresses))
+	for _, addr := range info.NetworkAddresses {
+		addresses = append(addresses, &proto.NetworkAddress{
+			NetIP: addr.NetIP.String(),
+			Mac:   addr.Mac,
+		})
+	}
+
+	files := make([]*proto.File, 0, len(info.Files))
+	for _, file := range info.Files {
+		files = append(files, &proto.File{
+			Path:             file.Path,
+			Exist:            file.Exist,
+			ProcessIsRunning: file.ProcessIsRunning,
+		})
+	}
+
 	return &proto.PeerSystemMeta{
 		Hostname:           info.Hostname,
 		GoOS:               info.GoOS,
 		OS:                 info.OS,
 		Core:               info.OSVersion,
+		OSVersion:          info.OSVersion,
 		Platform:           info.Platform,
 		Kernel:             info.Kernel,
 		WiretrusteeVersion: info.WiretrusteeVersion,
 		UiVersion:          info.UIVersion,
+		KernelVersion:      info.KernelVersion,
+		NetworkAddresses:   addresses,
+		SysSerialNumber:    info.SystemSerialNumber,
+		SysManufacturer:    info.SystemManufacturer,
+		SysProductName:     info.SystemProductName,
+		Environment: &proto.Environment{
+			Cloud:    info.Environment.Cloud,
+			Platform: info.Environment.Platform,
+		},
+		Files: files,
 	}
 }

@@ -5,14 +5,73 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
 	"github.com/miekg/dns"
+	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/mock"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/netbirdio/netbird/client/firewall/uspfilter"
+	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/iface/configurer"
+	"github.com/netbirdio/netbird/client/iface/device"
+	pfmock "github.com/netbirdio/netbird/client/iface/mocks"
+	"github.com/netbirdio/netbird/client/internal/peer"
+	"github.com/netbirdio/netbird/client/internal/statemanager"
+	"github.com/netbirdio/netbird/client/internal/stdnet"
 	nbdns "github.com/netbirdio/netbird/dns"
-	"github.com/netbirdio/netbird/iface"
+	"github.com/netbirdio/netbird/formatter"
 )
+
+type mocWGIface struct {
+	filter device.PacketFilter
+}
+
+func (w *mocWGIface) Name() string {
+	panic("implement me")
+}
+
+func (w *mocWGIface) Address() iface.WGAddress {
+	ip, network, _ := net.ParseCIDR("100.66.100.0/24")
+	return iface.WGAddress{
+		IP:      ip,
+		Network: network,
+	}
+}
+
+func (w *mocWGIface) ToInterface() *net.Interface {
+	panic("implement me")
+}
+
+func (w *mocWGIface) GetFilter() device.PacketFilter {
+	return w.filter
+}
+
+func (w *mocWGIface) GetDevice() *device.FilteredDevice {
+	panic("implement me")
+}
+
+func (w *mocWGIface) GetInterfaceGUIDString() (string, error) {
+	panic("implement me")
+}
+
+func (w *mocWGIface) IsUserspaceBind() bool {
+	return false
+}
+
+func (w *mocWGIface) SetFilter(filter device.PacketFilter) error {
+	w.filter = filter
+	return nil
+}
+
+func (w *mocWGIface) GetStats(_ string) (configurer.WGStats, error) {
+	return configurer.WGStats{}, nil
+}
 
 var zoneRecords = []nbdns.SimpleRecord{
 	{
@@ -22,6 +81,11 @@ var zoneRecords = []nbdns.SimpleRecord{
 		TTL:   300,
 		RData: "1.2.3.4",
 	},
+}
+
+func init() {
+	log.SetLevel(log.TraceLevel)
+	formatter.SetTextFormatter(log.StandardLogger())
 }
 
 func TestUpdateDNSServer(t *testing.T) {
@@ -38,21 +102,23 @@ func TestUpdateDNSServer(t *testing.T) {
 		},
 	}
 
+	dummyHandler := &localResolver{}
+
 	testCases := []struct {
 		name                string
-		initUpstreamMap     registrationMap
+		initUpstreamMap     registeredHandlerMap
 		initLocalMap        registrationMap
 		initSerial          uint64
 		inputSerial         uint64
 		inputUpdate         nbdns.Config
 		shouldFail          bool
-		expectedUpstreamMap registrationMap
+		expectedUpstreamMap registeredHandlerMap
 		expectedLocalMap    registrationMap
 	}{
 		{
 			name:            "Initial Config Should Succeed",
 			initLocalMap:    make(registrationMap),
-			initUpstreamMap: make(registrationMap),
+			initUpstreamMap: make(registeredHandlerMap),
 			initSerial:      0,
 			inputSerial:     1,
 			inputUpdate: nbdns.Config{
@@ -74,13 +140,13 @@ func TestUpdateDNSServer(t *testing.T) {
 					},
 				},
 			},
-			expectedUpstreamMap: registrationMap{"netbird.io": struct{}{}, "netbird.cloud": struct{}{}, nbdns.RootZone: struct{}{}},
+			expectedUpstreamMap: registeredHandlerMap{"netbird.io": dummyHandler, "netbird.cloud": dummyHandler, nbdns.RootZone: dummyHandler},
 			expectedLocalMap:    registrationMap{buildRecordKey(zoneRecords[0].Name, 1, 1): struct{}{}},
 		},
 		{
 			name:            "New Config Should Succeed",
 			initLocalMap:    registrationMap{"netbird.cloud": struct{}{}},
-			initUpstreamMap: registrationMap{buildRecordKey(zoneRecords[0].Name, 1, 1): struct{}{}},
+			initUpstreamMap: registeredHandlerMap{buildRecordKey(zoneRecords[0].Name, 1, 1): dummyHandler},
 			initSerial:      0,
 			inputSerial:     1,
 			inputUpdate: nbdns.Config{
@@ -98,13 +164,13 @@ func TestUpdateDNSServer(t *testing.T) {
 					},
 				},
 			},
-			expectedUpstreamMap: registrationMap{"netbird.io": struct{}{}, "netbird.cloud": struct{}{}},
+			expectedUpstreamMap: registeredHandlerMap{"netbird.io": dummyHandler, "netbird.cloud": dummyHandler},
 			expectedLocalMap:    registrationMap{buildRecordKey(zoneRecords[0].Name, 1, 1): struct{}{}},
 		},
 		{
 			name:            "Smaller Config Serial Should Be Skipped",
 			initLocalMap:    make(registrationMap),
-			initUpstreamMap: make(registrationMap),
+			initUpstreamMap: make(registeredHandlerMap),
 			initSerial:      2,
 			inputSerial:     1,
 			shouldFail:      true,
@@ -112,7 +178,7 @@ func TestUpdateDNSServer(t *testing.T) {
 		{
 			name:            "Empty NS Group Domain Or Not Primary Element Should Fail",
 			initLocalMap:    make(registrationMap),
-			initUpstreamMap: make(registrationMap),
+			initUpstreamMap: make(registeredHandlerMap),
 			initSerial:      0,
 			inputSerial:     1,
 			inputUpdate: nbdns.Config{
@@ -134,7 +200,7 @@ func TestUpdateDNSServer(t *testing.T) {
 		{
 			name:            "Invalid NS Group Nameservers list Should Fail",
 			initLocalMap:    make(registrationMap),
-			initUpstreamMap: make(registrationMap),
+			initUpstreamMap: make(registeredHandlerMap),
 			initSerial:      0,
 			inputSerial:     1,
 			inputUpdate: nbdns.Config{
@@ -156,7 +222,7 @@ func TestUpdateDNSServer(t *testing.T) {
 		{
 			name:            "Invalid Custom Zone Records list Should Fail",
 			initLocalMap:    make(registrationMap),
-			initUpstreamMap: make(registrationMap),
+			initUpstreamMap: make(registeredHandlerMap),
 			initSerial:      0,
 			inputSerial:     1,
 			inputUpdate: nbdns.Config{
@@ -178,28 +244,43 @@ func TestUpdateDNSServer(t *testing.T) {
 		{
 			name:                "Empty Config Should Succeed and Clean Maps",
 			initLocalMap:        registrationMap{"netbird.cloud": struct{}{}},
-			initUpstreamMap:     registrationMap{zoneRecords[0].Name: struct{}{}},
+			initUpstreamMap:     registeredHandlerMap{zoneRecords[0].Name: dummyHandler},
 			initSerial:          0,
 			inputSerial:         1,
 			inputUpdate:         nbdns.Config{ServiceEnable: true},
-			expectedUpstreamMap: make(registrationMap),
+			expectedUpstreamMap: make(registeredHandlerMap),
 			expectedLocalMap:    make(registrationMap),
 		},
 		{
 			name:                "Disabled Service Should clean map",
 			initLocalMap:        registrationMap{"netbird.cloud": struct{}{}},
-			initUpstreamMap:     registrationMap{zoneRecords[0].Name: struct{}{}},
+			initUpstreamMap:     registeredHandlerMap{zoneRecords[0].Name: dummyHandler},
 			initSerial:          0,
 			inputSerial:         1,
 			inputUpdate:         nbdns.Config{ServiceEnable: false},
-			expectedUpstreamMap: make(registrationMap),
+			expectedUpstreamMap: make(registeredHandlerMap),
 			expectedLocalMap:    make(registrationMap),
 		},
 	}
 
 	for n, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			wgIface, err := iface.NewWGIFace(fmt.Sprintf("utun230%d", n), fmt.Sprintf("100.66.100.%d/32", n+1), iface.DefaultMTU)
+			privKey, _ := wgtypes.GenerateKey()
+			newNet, err := stdnet.NewNet(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			opts := iface.WGIFaceOpts{
+				IFaceName:    fmt.Sprintf("utun230%d", n),
+				Address:      fmt.Sprintf("100.66.100.%d/32", n+1),
+				WGPort:       33100,
+				WGPrivKey:    privKey.String(),
+				MTU:          iface.DefaultMTU,
+				TransportNet: newNet,
+			}
+
+			wgIface, err := iface.NewWGIFace(opts)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -213,7 +294,11 @@ func TestUpdateDNSServer(t *testing.T) {
 					t.Log(err)
 				}
 			}()
-			dnsServer, err := NewDefaultServer(context.Background(), wgIface, "")
+			dnsServer, err := NewDefaultServer(context.Background(), wgIface, "", &peer.Status{}, nil, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = dnsServer.Initialize()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -227,8 +312,6 @@ func TestUpdateDNSServer(t *testing.T) {
 			dnsServer.dnsMuxMap = testCase.initUpstreamMap
 			dnsServer.localResolver.registeredMap = testCase.initLocalMap
 			dnsServer.updateSerial = testCase.initSerial
-			// pretend we are running
-			dnsServer.listenerIsRunning = true
 
 			err = dnsServer.UpdateDNSServer(testCase.inputSerial, testCase.inputUpdate)
 			if err != nil {
@@ -263,6 +346,142 @@ func TestUpdateDNSServer(t *testing.T) {
 	}
 }
 
+func TestDNSFakeResolverHandleUpdates(t *testing.T) {
+	ov := os.Getenv("NB_WG_KERNEL_DISABLED")
+	defer t.Setenv("NB_WG_KERNEL_DISABLED", ov)
+
+	t.Setenv("NB_WG_KERNEL_DISABLED", "true")
+	newNet, err := stdnet.NewNet(nil)
+	if err != nil {
+		t.Errorf("create stdnet: %v", err)
+		return
+	}
+
+	privKey, _ := wgtypes.GeneratePrivateKey()
+	opts := iface.WGIFaceOpts{
+		IFaceName:    "utun2301",
+		Address:      "100.66.100.1/32",
+		WGPort:       33100,
+		WGPrivKey:    privKey.String(),
+		MTU:          iface.DefaultMTU,
+		TransportNet: newNet,
+	}
+	wgIface, err := iface.NewWGIFace(opts)
+	if err != nil {
+		t.Errorf("build interface wireguard: %v", err)
+		return
+	}
+
+	err = wgIface.Create()
+	if err != nil {
+		t.Errorf("create and init wireguard interface: %v", err)
+		return
+	}
+	defer func() {
+		if err = wgIface.Close(); err != nil {
+			t.Logf("close wireguard interface: %v", err)
+		}
+	}()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	_, ipNet, err := net.ParseCIDR("100.66.100.1/32")
+	if err != nil {
+		t.Errorf("parse CIDR: %v", err)
+		return
+	}
+
+	packetfilter := pfmock.NewMockPacketFilter(ctrl)
+	packetfilter.EXPECT().DropOutgoing(gomock.Any()).AnyTimes()
+	packetfilter.EXPECT().AddUDPPacketHook(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+	packetfilter.EXPECT().RemovePacketHook(gomock.Any())
+	packetfilter.EXPECT().SetNetwork(ipNet)
+
+	if err := wgIface.SetFilter(packetfilter); err != nil {
+		t.Errorf("set packet filter: %v", err)
+		return
+	}
+
+	dnsServer, err := NewDefaultServer(context.Background(), wgIface, "", &peer.Status{}, nil, false)
+	if err != nil {
+		t.Errorf("create DNS server: %v", err)
+		return
+	}
+
+	err = dnsServer.Initialize()
+	if err != nil {
+		t.Errorf("run DNS server: %v", err)
+		return
+	}
+	defer func() {
+		if err = dnsServer.hostManager.restoreHostDNS(); err != nil {
+			t.Logf("restore DNS settings on the host: %v", err)
+			return
+		}
+	}()
+
+	dnsServer.dnsMuxMap = registeredHandlerMap{zoneRecords[0].Name: &localResolver{}}
+	dnsServer.localResolver.registeredMap = registrationMap{"netbird.cloud": struct{}{}}
+	dnsServer.updateSerial = 0
+
+	nameServers := []nbdns.NameServer{
+		{
+			IP:     netip.MustParseAddr("8.8.8.8"),
+			NSType: nbdns.UDPNameServerType,
+			Port:   53,
+		},
+		{
+			IP:     netip.MustParseAddr("8.8.4.4"),
+			NSType: nbdns.UDPNameServerType,
+			Port:   53,
+		},
+	}
+
+	update := nbdns.Config{
+		ServiceEnable: true,
+		CustomZones: []nbdns.CustomZone{
+			{
+				Domain:  "netbird.cloud",
+				Records: zoneRecords,
+			},
+		},
+		NameServerGroups: []*nbdns.NameServerGroup{
+			{
+				Domains:     []string{"netbird.io"},
+				NameServers: nameServers,
+			},
+			{
+				NameServers: nameServers,
+				Primary:     true,
+			},
+		},
+	}
+
+	// Start the server with regular configuration
+	if err := dnsServer.UpdateDNSServer(1, update); err != nil {
+		t.Fatalf("update dns server should not fail, got error: %v", err)
+		return
+	}
+
+	update2 := update
+	update2.ServiceEnable = false
+	// Disable the server, stop the listener
+	if err := dnsServer.UpdateDNSServer(2, update2); err != nil {
+		t.Fatalf("update dns server should not fail, got error: %v", err)
+		return
+	}
+
+	update3 := update2
+	update3.NameServerGroups = update3.NameServerGroups[:1]
+	// But service still get updates and we checking that we handle
+	// internal state in the right way
+	if err := dnsServer.UpdateDNSServer(3, update3); err != nil {
+		t.Fatalf("update dns server should not fail, got error: %v", err)
+		return
+	}
+}
+
 func TestDNSServerStartStop(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -279,21 +498,23 @@ func TestDNSServerStartStop(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			dnsServer := getDefaultServerWithNoHostManager(t, testCase.addrPort)
-
-			dnsServer.hostManager = newNoopHostMocker()
-			dnsServer.Start()
-			time.Sleep(100 * time.Millisecond)
-			if !dnsServer.listenerIsRunning {
-				t.Fatal("dns server listener is not running")
+			dnsServer, err := NewDefaultServer(context.Background(), &mocWGIface{}, testCase.addrPort, &peer.Status{}, nil, false)
+			if err != nil {
+				t.Fatalf("%v", err)
 			}
+			dnsServer.hostManager = newNoopHostMocker()
+			err = dnsServer.service.Listen()
+			if err != nil {
+				t.Fatalf("dns server is not running: %s", err)
+			}
+			time.Sleep(100 * time.Millisecond)
 			defer dnsServer.Stop()
-			err := dnsServer.localResolver.registerRecord(zoneRecords[0])
+			err = dnsServer.localResolver.registerRecord(zoneRecords[0])
 			if err != nil {
 				t.Error(err)
 			}
 
-			dnsServer.dnsMux.Handle("netbird.cloud", dnsServer.localResolver)
+			dnsServer.registerHandler([]string{"netbird.cloud"}, dnsServer.localResolver, 1)
 
 			resolver := &net.Resolver{
 				PreferGo: true,
@@ -301,7 +522,7 @@ func TestDNSServerStartStop(t *testing.T) {
 					d := net.Dialer{
 						Timeout: time.Second * 5,
 					}
-					addr := fmt.Sprintf("%s:%d", dnsServer.runtimeIP, dnsServer.runtimePort)
+					addr := fmt.Sprintf("%s:%d", dnsServer.service.RuntimeIP(), dnsServer.service.RuntimePort())
 					conn, err := d.DialContext(ctx, network, addr)
 					if err != nil {
 						t.Log(err)
@@ -336,28 +557,32 @@ func TestDNSServerStartStop(t *testing.T) {
 func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 	hostManager := &mockHostConfigurator{}
 	server := DefaultServer{
-		dnsMux: dns.DefaultServeMux,
+		ctx:     context.Background(),
+		service: NewServiceViaMemory(&mocWGIface{}),
 		localResolver: &localResolver{
 			registeredMap: make(registrationMap),
 		},
-		hostManager: hostManager,
-		currentConfig: hostDNSConfig{
-			domains: []domainConfig{
+		handlerChain:      NewHandlerChain(),
+		handlerPriorities: make(map[string]int),
+		hostManager:       hostManager,
+		currentConfig: HostDNSConfig{
+			Domains: []DomainConfig{
 				{false, "domain0", false},
 				{false, "domain1", false},
 				{false, "domain2", false},
 			},
 		},
+		statusRecorder: &peer.Status{},
 	}
 
 	var domainsUpdate string
-	hostManager.applyDNSConfigFunc = func(config hostDNSConfig) error {
+	hostManager.applyDNSConfigFunc = func(config HostDNSConfig, statemanager *statemanager.Manager) error {
 		domains := []string{}
-		for _, item := range config.domains {
-			if item.disabled {
+		for _, item := range config.Domains {
+			if item.Disabled {
 				continue
 			}
-			domains = append(domains, item.domain)
+			domains = append(domains, item.Domain)
 		}
 		domainsUpdate = strings.Join(domains, ",")
 		return nil
@@ -370,14 +595,14 @@ func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 		},
 	}, nil)
 
-	deactivate()
+	deactivate(nil)
 	expected := "domain0,domain2"
 	domains := []string{}
-	for _, item := range server.currentConfig.domains {
-		if item.disabled {
+	for _, item := range server.currentConfig.Domains {
+		if item.Disabled {
 			continue
 		}
-		domains = append(domains, item.domain)
+		domains = append(domains, item.Domain)
 	}
 	got := strings.Join(domains, ",")
 	if expected != got {
@@ -387,11 +612,11 @@ func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 	reactivate()
 	expected = "domain0,domain1,domain2"
 	domains = []string{}
-	for _, item := range server.currentConfig.domains {
-		if item.disabled {
+	for _, item := range server.currentConfig.Domains {
+		if item.Disabled {
 			continue
 		}
-		domains = append(domains, item.domain)
+		domains = append(domains, item.Domain)
 	}
 	got = strings.Join(domains, ",")
 	if expected != got {
@@ -399,35 +624,338 @@ func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 	}
 }
 
-func getDefaultServerWithNoHostManager(t *testing.T, addrPort string) *DefaultServer {
-	mux := dns.NewServeMux()
+func TestDNSPermanent_updateHostDNS_emptyUpstream(t *testing.T) {
+	wgIFace, err := createWgInterfaceWithBind(t)
+	if err != nil {
+		t.Fatal("failed to initialize wg interface")
+	}
+	defer wgIFace.Close()
 
-	var parsedAddrPort *netip.AddrPort
-	if addrPort != "" {
-		parsed, err := netip.ParseAddrPort(addrPort)
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsedAddrPort = &parsed
+	var dnsList []string
+	dnsConfig := nbdns.Config{}
+	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, dnsList, dnsConfig, nil, &peer.Status{}, false)
+	err = dnsServer.Initialize()
+	if err != nil {
+		t.Errorf("failed to initialize DNS server: %v", err)
+		return
+	}
+	defer dnsServer.Stop()
+
+	dnsServer.OnUpdatedHostDNSServer([]string{"8.8.8.8"})
+
+	resolver := newDnsResolver(dnsServer.service.RuntimeIP(), dnsServer.service.RuntimePort())
+	_, err = resolver.LookupHost(context.Background(), "netbird.io")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
+	}
+}
+
+func TestDNSPermanent_updateUpstream(t *testing.T) {
+	wgIFace, err := createWgInterfaceWithBind(t)
+	if err != nil {
+		t.Fatal("failed to initialize wg interface")
+	}
+	defer wgIFace.Close()
+	dnsConfig := nbdns.Config{}
+	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, []string{"8.8.8.8"}, dnsConfig, nil, &peer.Status{}, false)
+	err = dnsServer.Initialize()
+	if err != nil {
+		t.Errorf("failed to initialize DNS server: %v", err)
+		return
+	}
+	defer dnsServer.Stop()
+
+	// check initial state
+	resolver := newDnsResolver(dnsServer.service.RuntimeIP(), dnsServer.service.RuntimePort())
+	_, err = resolver.LookupHost(context.Background(), "netbird.io")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
 	}
 
-	dnsServer := &dns.Server{
-		Net:     "udp",
-		Handler: mux,
-		UDPSize: 65535,
-	}
-
-	ctx, cancel := context.WithCancel(context.TODO())
-
-	return &DefaultServer{
-		ctx:       ctx,
-		ctxCancel: cancel,
-		server:    dnsServer,
-		dnsMux:    mux,
-		dnsMuxMap: make(registrationMap),
-		localResolver: &localResolver{
-			registeredMap: make(registrationMap),
+	update := nbdns.Config{
+		ServiceEnable: true,
+		CustomZones: []nbdns.CustomZone{
+			{
+				Domain:  "netbird.cloud",
+				Records: zoneRecords,
+			},
 		},
-		customAddress: parsedAddrPort,
+		NameServerGroups: []*nbdns.NameServerGroup{
+			{
+				NameServers: []nbdns.NameServer{
+					{
+						IP:     netip.MustParseAddr("8.8.4.4"),
+						NSType: nbdns.UDPNameServerType,
+						Port:   53,
+					},
+				},
+				Enabled: true,
+				Primary: true,
+			},
+		},
+	}
+
+	err = dnsServer.UpdateDNSServer(1, update)
+	if err != nil {
+		t.Errorf("failed to update dns server: %s", err)
+	}
+
+	_, err = resolver.LookupHost(context.Background(), "netbird.io")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
+	}
+	ips, err := resolver.LookupHost(context.Background(), zoneRecords[0].Name)
+	if err != nil {
+		t.Fatalf("failed resolve zone record: %v", err)
+	}
+	if ips[0] != zoneRecords[0].RData {
+		t.Fatalf("invalid zone record: %v", err)
+	}
+
+	update2 := nbdns.Config{
+		ServiceEnable: true,
+		CustomZones: []nbdns.CustomZone{
+			{
+				Domain:  "netbird.cloud",
+				Records: zoneRecords,
+			},
+		},
+		NameServerGroups: []*nbdns.NameServerGroup{},
+	}
+
+	err = dnsServer.UpdateDNSServer(2, update2)
+	if err != nil {
+		t.Errorf("failed to update dns server: %s", err)
+	}
+
+	_, err = resolver.LookupHost(context.Background(), "netbird.io")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
+	}
+
+	ips, err = resolver.LookupHost(context.Background(), zoneRecords[0].Name)
+	if err != nil {
+		t.Fatalf("failed resolve zone record: %v", err)
+	}
+	if ips[0] != zoneRecords[0].RData {
+		t.Fatalf("invalid zone record: %v", err)
+	}
+}
+
+func TestDNSPermanent_matchOnly(t *testing.T) {
+	wgIFace, err := createWgInterfaceWithBind(t)
+	if err != nil {
+		t.Fatal("failed to initialize wg interface")
+	}
+	defer wgIFace.Close()
+	dnsConfig := nbdns.Config{}
+	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, []string{"8.8.8.8"}, dnsConfig, nil, &peer.Status{}, false)
+	err = dnsServer.Initialize()
+	if err != nil {
+		t.Errorf("failed to initialize DNS server: %v", err)
+		return
+	}
+	defer dnsServer.Stop()
+
+	// check initial state
+	resolver := newDnsResolver(dnsServer.service.RuntimeIP(), dnsServer.service.RuntimePort())
+	_, err = resolver.LookupHost(context.Background(), "netbird.io")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
+	}
+
+	update := nbdns.Config{
+		ServiceEnable: true,
+		CustomZones: []nbdns.CustomZone{
+			{
+				Domain:  "netbird.cloud",
+				Records: zoneRecords,
+			},
+		},
+		NameServerGroups: []*nbdns.NameServerGroup{
+			{
+				NameServers: []nbdns.NameServer{
+					{
+						IP:     netip.MustParseAddr("8.8.4.4"),
+						NSType: nbdns.UDPNameServerType,
+						Port:   53,
+					},
+					{
+						IP:     netip.MustParseAddr("9.9.9.9"),
+						NSType: nbdns.UDPNameServerType,
+						Port:   53,
+					},
+				},
+				Domains: []string{"google.com"},
+				Primary: false,
+			},
+		},
+	}
+
+	err = dnsServer.UpdateDNSServer(1, update)
+	if err != nil {
+		t.Errorf("failed to update dns server: %s", err)
+	}
+
+	_, err = resolver.LookupHost(context.Background(), "netbird.io")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
+	}
+	ips, err := resolver.LookupHost(context.Background(), zoneRecords[0].Name)
+	if err != nil {
+		t.Fatalf("failed resolve zone record: %v", err)
+	}
+	if ips[0] != zoneRecords[0].RData {
+		t.Fatalf("invalid zone record: %v", err)
+	}
+	_, err = resolver.LookupHost(context.Background(), "google.com")
+	if err != nil {
+		t.Errorf("failed to resolve: %s", err)
+	}
+}
+
+func createWgInterfaceWithBind(t *testing.T) (*iface.WGIface, error) {
+	t.Helper()
+	ov := os.Getenv("NB_WG_KERNEL_DISABLED")
+	defer t.Setenv("NB_WG_KERNEL_DISABLED", ov)
+
+	t.Setenv("NB_WG_KERNEL_DISABLED", "true")
+	newNet, err := stdnet.NewNet(nil)
+	if err != nil {
+		t.Fatalf("create stdnet: %v", err)
+		return nil, err
+	}
+
+	privKey, _ := wgtypes.GeneratePrivateKey()
+
+	opts := iface.WGIFaceOpts{
+		IFaceName:    "utun2301",
+		Address:      "100.66.100.2/24",
+		WGPort:       33100,
+		WGPrivKey:    privKey.String(),
+		MTU:          iface.DefaultMTU,
+		TransportNet: newNet,
+	}
+
+	wgIface, err := iface.NewWGIFace(opts)
+	if err != nil {
+		t.Fatalf("build interface wireguard: %v", err)
+		return nil, err
+	}
+
+	err = wgIface.Create()
+	if err != nil {
+		t.Fatalf("create and init wireguard interface: %v", err)
+		return nil, err
+	}
+
+	pf, err := uspfilter.Create(wgIface)
+	if err != nil {
+		t.Fatalf("failed to create uspfilter: %v", err)
+		return nil, err
+	}
+
+	err = wgIface.SetFilter(pf)
+	if err != nil {
+		t.Fatalf("set packet filter: %v", err)
+		return nil, err
+	}
+
+	return wgIface, nil
+}
+
+func newDnsResolver(ip string, port int) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: time.Second * 3,
+			}
+			addr := fmt.Sprintf("%s:%d", ip, port)
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+}
+
+// MockHandler implements dns.Handler interface for testing
+type MockHandler struct {
+	mock.Mock
+}
+
+func (m *MockHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+	m.Called(w, r)
+}
+
+type MockSubdomainHandler struct {
+	MockHandler
+	Subdomains bool
+}
+
+func (m *MockSubdomainHandler) MatchSubdomains() bool {
+	return m.Subdomains
+}
+
+func TestHandlerChain_DomainPriorities(t *testing.T) {
+	chain := NewHandlerChain()
+
+	dnsRouteHandler := &MockHandler{}
+	upstreamHandler := &MockSubdomainHandler{
+		Subdomains: true,
+	}
+
+	chain.AddHandler("example.com.", dnsRouteHandler, PriorityDNSRoute, nil)
+	chain.AddHandler("example.com.", upstreamHandler, PriorityMatchDomain, nil)
+
+	testCases := []struct {
+		name            string
+		query           string
+		expectedHandler dns.Handler
+	}{
+		{
+			name:            "exact domain with dns route handler",
+			query:           "example.com.",
+			expectedHandler: dnsRouteHandler,
+		},
+		{
+			name:            "subdomain should use upstream handler",
+			query:           "sub.example.com.",
+			expectedHandler: upstreamHandler,
+		},
+		{
+			name:            "deep subdomain should use upstream handler",
+			query:           "deep.sub.example.com.",
+			expectedHandler: upstreamHandler,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := new(dns.Msg)
+			r.SetQuestion(tc.query, dns.TypeA)
+			w := &ResponseWriterChain{ResponseWriter: &mockResponseWriter{}}
+
+			if mh, ok := tc.expectedHandler.(*MockHandler); ok {
+				mh.On("ServeDNS", mock.Anything, r).Once()
+			} else if mh, ok := tc.expectedHandler.(*MockSubdomainHandler); ok {
+				mh.On("ServeDNS", mock.Anything, r).Once()
+			}
+
+			chain.ServeDNS(w, r)
+
+			if mh, ok := tc.expectedHandler.(*MockHandler); ok {
+				mh.AssertExpectations(t)
+			} else if mh, ok := tc.expectedHandler.(*MockSubdomainHandler); ok {
+				mh.AssertExpectations(t)
+			}
+
+			// Reset mocks
+			if mh, ok := tc.expectedHandler.(*MockHandler); ok {
+				mh.ExpectedCalls = nil
+				mh.Calls = nil
+			} else if mh, ok := tc.expectedHandler.(*MockSubdomainHandler); ok {
+				mh.ExpectedCalls = nil
+				mh.Calls = nil
+			}
+		})
 	}
 }

@@ -2,10 +2,12 @@ package dns
 
 import (
 	"context"
-	"github.com/miekg/dns"
+	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 func TestUpstreamResolver_ServeDNS(t *testing.T) {
@@ -48,15 +50,6 @@ func TestUpstreamResolver_ServeDNS(t *testing.T) {
 			timeout:             upstreamTimeout,
 			responseShouldBeNil: true,
 		},
-		//{
-		//	name:        "Should Resolve CNAME Record",
-		//	inputMSG:    new(dns.Msg).SetQuestion("one.one.one.one", dns.TypeCNAME),
-		//},
-		//{
-		//	name:                "Should Not Write When Not Found A Record",
-		//	inputMSG:            new(dns.Msg).SetQuestion("not.found.com", dns.TypeA),
-		//	responseShouldBeNil: true,
-		//},
 	}
 	// should resolve if first upstream times out
 	// should not write when both fails
@@ -65,7 +58,7 @@ func TestUpstreamResolver_ServeDNS(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.TODO())
-			resolver := newUpstreamResolver(ctx)
+			resolver, _ := newUpstreamResolver(ctx, "", net.IP{}, &net.IPNet{}, nil, nil)
 			resolver.upstreamServers = testCase.InputServers
 			resolver.upstreamTimeout = testCase.timeout
 			if testCase.cancelCTX {
@@ -106,8 +99,29 @@ func TestUpstreamResolver_ServeDNS(t *testing.T) {
 	}
 }
 
+type mockUpstreamResolver struct {
+	r   *dns.Msg
+	rtt time.Duration
+	err error
+}
+
+// exchange mock implementation of exchange from upstreamResolver
+func (c mockUpstreamResolver) exchange(_ context.Context, _ string, _ *dns.Msg) (*dns.Msg, time.Duration, error) {
+	return c.r, c.rtt, c.err
+}
+
 func TestUpstreamResolver_DeactivationReactivation(t *testing.T) {
-	resolver := newUpstreamResolver(context.TODO())
+	resolver := &upstreamResolverBase{
+		ctx: context.TODO(),
+		upstreamClient: &mockUpstreamResolver{
+			err: nil,
+			r:   new(dns.Msg),
+			rtt: time.Millisecond,
+		},
+		upstreamTimeout:  upstreamTimeout,
+		reactivatePeriod: reactivatePeriod,
+		failsTillDeact:   failsTillDeact,
+	}
 	resolver.upstreamServers = []string{"0.0.0.0:-1"}
 	resolver.failsTillDeact = 0
 	resolver.reactivatePeriod = time.Microsecond * 100
@@ -117,7 +131,7 @@ func TestUpstreamResolver_DeactivationReactivation(t *testing.T) {
 	}
 
 	failed := false
-	resolver.deactivate = func() {
+	resolver.deactivate = func(error) {
 		failed = true
 	}
 
@@ -134,7 +148,7 @@ func TestUpstreamResolver_DeactivationReactivation(t *testing.T) {
 	}
 
 	if !resolver.disabled {
-		t.Errorf("resolver should be disabled")
+		t.Errorf("resolver should be Disabled")
 		return
 	}
 

@@ -5,16 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/hashicorp/go-version"
-	"github.com/netbirdio/netbird/client/system"
-	"github.com/netbirdio/netbird/management/server"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
-	"regexp"
+	"os"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/go-version"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/management/server/store"
+	"github.com/netbirdio/netbird/management/server/types"
+	nbversion "github.com/netbirdio/netbird/version"
 )
 
 const (
@@ -23,9 +26,9 @@ const (
 	// payloadEndpoint metrics defaultEndpoint to send anonymous data
 	payloadEndpoint = "https://metrics.netbird.io"
 	// defaultPushInterval default interval to push metrics
-	defaultPushInterval = 24 * time.Hour
+	defaultPushInterval = 12 * time.Hour
 	// requestTimeout http request timeout
-	requestTimeout = 30 * time.Second
+	requestTimeout = 45 * time.Second
 )
 
 type getTokenResponse struct {
@@ -45,7 +48,8 @@ type properties map[string]interface{}
 
 // DataSource metric data source
 type DataSource interface {
-	GetAllAccounts() []*server.Account
+	GetAllAccounts(ctx context.Context) []*types.Account
+	GetStoreEngine() store.Engine
 }
 
 // ConnManager peer connection manager that holds state for current active connections
@@ -57,6 +61,7 @@ type ConnManager interface {
 type Worker struct {
 	ctx         context.Context
 	id          string
+	idpManager  string
 	dataSource  DataSource
 	connManager ConnManager
 	startupTime time.Time
@@ -64,11 +69,12 @@ type Worker struct {
 }
 
 // NewWorker returns a metrics worker
-func NewWorker(ctx context.Context, id string, dataSource DataSource, connManager ConnManager) *Worker {
+func NewWorker(ctx context.Context, id string, dataSource DataSource, connManager ConnManager, idpManager string) *Worker {
 	currentTime := time.Now()
 	return &Worker{
 		ctx:         ctx,
 		id:          id,
+		idpManager:  idpManager,
 		dataSource:  dataSource,
 		connManager: connManager,
 		startupTime: currentTime,
@@ -77,32 +83,45 @@ func NewWorker(ctx context.Context, id string, dataSource DataSource, connManage
 }
 
 // Run runs the metrics worker
-func (w *Worker) Run() {
-	pushTicker := time.NewTicker(defaultPushInterval)
+func (w *Worker) Run(ctx context.Context) {
+	interval := getMetricsInterval(ctx)
+
+	pushTicker := time.NewTicker(interval)
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
 		case <-pushTicker.C:
-			err := w.sendMetrics()
+			err := w.sendMetrics(ctx)
 			if err != nil {
-				log.Error(err)
+				log.WithContext(ctx).Error(err)
 			}
 			w.lastRun = time.Now()
 		}
 	}
 }
 
-func (w *Worker) sendMetrics() error {
-	ctx, cancel := context.WithTimeout(w.ctx, requestTimeout)
-	defer cancel()
+func getMetricsInterval(ctx context.Context) time.Duration {
+	interval := defaultPushInterval
+	if os.Getenv("NETBIRD_METRICS_INTERVAL_IN_SECONDS") != "" {
+		newInterval, err := time.ParseDuration(os.Getenv("NETBIRD_METRICS_INTERVAL_IN_SECONDS") + "s")
+		if err != nil {
+			log.WithContext(ctx).Errorf("unable to parse NETBIRD_METRICS_INTERVAL_IN_SECONDS, using default interval %v. Error: %v", defaultPushInterval, err)
+		} else {
+			log.WithContext(ctx).Infof("using NETBIRD_METRICS_INTERVAL_IN_SECONDS %s", newInterval)
+			interval = newInterval
+		}
+	}
+	return interval
+}
 
-	apiKey, err := getAPIKey(ctx)
+func (w *Worker) sendMetrics(ctx context.Context) error {
+	apiKey, err := getAPIKey(w.ctx)
 	if err != nil {
 		return err
 	}
 
-	payload := w.generatePayload(apiKey)
+	payload := w.generatePayload(ctx, apiKey)
 
 	payloadString, err := buildMetricsPayload(payload)
 	if err != nil {
@@ -111,10 +130,11 @@ func (w *Worker) sendMetrics() error {
 
 	httpClient := http.Client{}
 
-	exportJobReq, err := createPostRequest(ctx, payloadEndpoint+"/capture/", payloadString)
+	exportJobReq, cancelCTX, err := createPostRequest(w.ctx, payloadEndpoint+"/capture/", payloadString)
 	if err != nil {
 		return fmt.Errorf("unable to create metrics post request %v", err)
 	}
+	defer cancelCTX()
 
 	jobResp, err := httpClient.Do(exportJobReq)
 	if err != nil {
@@ -124,7 +144,7 @@ func (w *Worker) sendMetrics() error {
 	defer func() {
 		err = jobResp.Body.Close()
 		if err != nil {
-			log.Errorf("error while closing update metrics response body: %v", err)
+			log.WithContext(ctx).Errorf("error while closing update metrics response body: %v", err)
 		}
 	}()
 
@@ -132,15 +152,15 @@ func (w *Worker) sendMetrics() error {
 		return fmt.Errorf("unable to push anonymous metrics, got statusCode %d", jobResp.StatusCode)
 	}
 
-	log.Infof("sent anonymous metrics, next push will happen in %s. "+
+	log.WithContext(ctx).Infof("sent anonymous metrics, next push will happen in %s. "+
 		"You can disable these metrics by running with flag --disable-anonymous-metrics,"+
-		" see more information at https://netbird.io/docs/FAQ/metrics-collection", defaultPushInterval)
+		" see more information at https://docs.netbird.io/about-netbird/faq#why-and-what-are-the-anonymous-usage-metrics", getMetricsInterval(ctx))
 
 	return nil
 }
 
-func (w *Worker) generatePayload(apiKey string) pushPayload {
-	properties := w.generateProperties()
+func (w *Worker) generatePayload(ctx context.Context, apiKey string) pushPayload {
+	properties := w.generateProperties(ctx)
 
 	return pushPayload{
 		APIKey:     apiKey,
@@ -151,48 +171,118 @@ func (w *Worker) generatePayload(apiKey string) pushPayload {
 	}
 }
 
-func (w *Worker) generateProperties() properties {
+func (w *Worker) generateProperties(ctx context.Context) properties {
 	var (
-		uptime             float64
-		accounts           int
-		users              int
-		peers              int
-		setupKeysUsage     int
-		activePeersLastDay int
-		osPeers            map[string]int
-		userPeers          int
-		rules              int
-		groups             int
-		routes             int
-		nameservers        int
-		uiClient           int
-		version            string
-		peerActiveVersions []string
-		osUIClients        map[string]int
+		uptime                    float64
+		accounts                  int
+		expirationEnabled         int
+		users                     int
+		serviceUsers              int
+		pats                      int
+		peers                     int
+		peersSSHEnabled           int
+		setupKeysUsage            int
+		ephemeralPeersSKs         int
+		ephemeralPeersSKUsage     int
+		activePeersLastDay        int
+		osPeers                   map[string]int
+		userPeers                 int
+		rules                     int
+		rulesProtocol             map[string]int
+		rulesDirection            map[string]int
+		rulesWithSrcPostureChecks int
+		postureChecks             int
+		groups                    int
+		routes                    int
+		routesWithRGGroups        int
+		networks                  int
+		networkResources          int
+		networkRouters            int
+		networkRoutersWithPG      int
+		nameservers               int
+		uiClient                  int
+		version                   string
+		peerActiveVersions        []string
+		osUIClients               map[string]int
 	)
 	start := time.Now()
 	metricsProperties := make(properties)
 	osPeers = make(map[string]int)
 	osUIClients = make(map[string]int)
+	rulesProtocol = make(map[string]int)
+	rulesDirection = make(map[string]int)
 	uptime = time.Since(w.startupTime).Seconds()
 	connections := w.connManager.GetAllConnectedPeers()
-	version = system.NetbirdVersion()
+	version = nbversion.NetbirdVersion()
 
-	for _, account := range w.dataSource.GetAllAccounts() {
+	for _, account := range w.dataSource.GetAllAccounts(ctx) {
 		accounts++
-		users = users + len(account.Users)
-		rules = rules + len(account.Rules)
-		groups = groups + len(account.Groups)
-		routes = routes + len(account.Routes)
-		nameservers = nameservers + len(account.NameServerGroups)
+
+		if account.Settings.PeerLoginExpirationEnabled {
+			expirationEnabled++
+		}
+
+		groups += len(account.Groups)
+		networks += len(account.Networks)
+		networkResources += len(account.NetworkResources)
+
+		networkRouters += len(account.NetworkRouters)
+		for _, router := range account.NetworkRouters {
+			if len(router.PeerGroups) > 0 {
+				networkRoutersWithPG++
+			}
+		}
+
+		routes += len(account.Routes)
+		for _, route := range account.Routes {
+			if len(route.PeerGroups) > 0 {
+				routesWithRGGroups++
+			}
+		}
+		nameservers += len(account.NameServerGroups)
+
+		for _, policy := range account.Policies {
+			for _, rule := range policy.Rules {
+				rules++
+				rulesProtocol[string(rule.Protocol)]++
+				if rule.Bidirectional {
+					rulesDirection["bidirectional"]++
+				} else {
+					rulesDirection["oneway"]++
+				}
+			}
+			if len(policy.SourcePostureChecks) > 0 {
+				rulesWithSrcPostureChecks++
+			}
+		}
+
+		postureChecks += len(account.PostureChecks)
+
+		for _, user := range account.Users {
+			if user.IsServiceUser {
+				serviceUsers++
+			} else {
+				users++
+			}
+			pats += len(user.PATs)
+		}
 
 		for _, key := range account.SetupKeys {
-			setupKeysUsage = setupKeysUsage + key.UsedTimes
+			setupKeysUsage += key.UsedTimes
+			if key.Ephemeral {
+				ephemeralPeersSKs++
+				ephemeralPeersSKUsage += key.UsedTimes
+			}
 		}
 
 		for _, peer := range account.Peers {
 			peers++
-			if peer.SetupKey == "" {
+
+			if peer.SSHEnabled {
+				peersSSHEnabled++
+			}
+
+			if peer.UserID != "" {
 				userPeers++
 			}
 
@@ -222,18 +312,42 @@ func (w *Worker) generateProperties() properties {
 	metricsProperties["uptime"] = uptime
 	metricsProperties["accounts"] = accounts
 	metricsProperties["users"] = users
+	metricsProperties["service_users"] = serviceUsers
+	metricsProperties["pats"] = pats
 	metricsProperties["peers"] = peers
+	metricsProperties["peers_ssh_enabled"] = peersSSHEnabled
+	metricsProperties["peers_login_expiration_enabled"] = expirationEnabled
 	metricsProperties["setup_keys_usage"] = setupKeysUsage
+	metricsProperties["ephemeral_peers_setup_keys"] = ephemeralPeersSKs
+	metricsProperties["ephemeral_peers_setup_keys_usage"] = ephemeralPeersSKUsage
 	metricsProperties["active_peers_last_day"] = activePeersLastDay
 	metricsProperties["user_peers"] = userPeers
 	metricsProperties["rules"] = rules
+	metricsProperties["rules_with_src_posture_checks"] = rulesWithSrcPostureChecks
+	metricsProperties["posture_checks"] = postureChecks
 	metricsProperties["groups"] = groups
+	metricsProperties["networks"] = networks
+	metricsProperties["network_resources"] = networkResources
+	metricsProperties["network_routers"] = networkRouters
+	metricsProperties["network_routers_with_groups"] = networkRoutersWithPG
 	metricsProperties["routes"] = routes
+	metricsProperties["routes_with_routing_groups"] = routesWithRGGroups
 	metricsProperties["nameservers"] = nameservers
 	metricsProperties["version"] = version
 	metricsProperties["min_active_peer_version"] = minActivePeerVersion
 	metricsProperties["max_active_peer_version"] = maxActivePeerVersion
 	metricsProperties["ui_clients"] = uiClient
+	metricsProperties["idp_manager"] = w.idpManager
+	metricsProperties["store_engine"] = w.dataSource.GetStoreEngine()
+
+	for protocol, count := range rulesProtocol {
+		metricsProperties["rules_protocol_"+protocol] = count
+	}
+
+	for direction, count := range rulesDirection {
+		metricsProperties["rules_direction_"+direction] = count
+	}
+
 	for os, count := range osPeers {
 		metricsProperties[os] = count
 	}
@@ -248,6 +362,8 @@ func (w *Worker) generateProperties() properties {
 }
 
 func getAPIKey(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
 
 	httpClient := http.Client{}
 
@@ -263,7 +379,7 @@ func getAPIKey(ctx context.Context) (string, error) {
 	defer func() {
 		err = response.Body.Close()
 		if err != nil {
-			log.Errorf("error while closing metrics token response body: %v", err)
+			log.WithContext(ctx).Errorf("error while closing metrics token response body: %v", err)
 		}
 	}()
 
@@ -294,44 +410,45 @@ func buildMetricsPayload(payload pushPayload) (string, error) {
 	return string(str), nil
 }
 
-func createPostRequest(ctx context.Context, endpoint string, payloadStr string) (*http.Request, error) {
+func createPostRequest(ctx context.Context, endpoint string, payloadStr string) (*http.Request, context.CancelFunc, error) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	reqURL := endpoint
 
 	payload := strings.NewReader(payloadStr)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, payload)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 	req.Header.Add("content-type", "application/json")
 
-	return req, nil
+	return req, cancel, nil
 }
 
 func getMinMaxVersion(inputList []string) (string, string) {
-	reg, err := regexp.Compile(version.SemverRegexpRaw)
-	if err != nil {
-		return "", ""
-	}
-
 	versions := make([]*version.Version, 0)
 
 	for _, raw := range inputList {
-		if raw != "" && reg.MatchString(raw) {
+		if raw != "" && nbversion.SemverRegexp.MatchString(raw) {
 			v, err := version.NewVersion(raw)
 			if err == nil {
 				versions = append(versions, v)
 			}
 		}
 	}
-	switch len(versions) {
+
+	targetIndex := 1
+	l := len(versions)
+
+	switch l {
 	case 0:
 		return "", ""
-	case 1:
-		v := versions[0].String()
+	case targetIndex:
+		v := versions[targetIndex-1].String()
 		return v, v
 	default:
 		sort.Sort(version.Collection(versions))
-		return versions[0].String(), versions[len(versions)-1].String()
+		return versions[targetIndex-1].String(), versions[l-1].String()
 	}
 }

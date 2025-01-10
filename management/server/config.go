@@ -1,9 +1,11 @@
 package server
 
 import (
+	"net/netip"
 	"net/url"
 
 	"github.com/netbirdio/netbird/management/server/idp"
+	"github.com/netbirdio/netbird/management/server/store"
 	"github.com/netbirdio/netbird/util"
 )
 
@@ -24,19 +26,47 @@ const (
 	NONE  Provider = "none"
 )
 
+const (
+	// DefaultDeviceAuthFlowScope defines the bare minimum scope to request in the device authorization flow
+	DefaultDeviceAuthFlowScope string = "openid"
+)
+
 // Config of the Management service
 type Config struct {
 	Stuns      []*Host
 	TURNConfig *TURNConfig
+	Relay      *Relay
 	Signal     *Host
 
-	Datadir string
+	Datadir                string
+	DataStoreEncryptionKey string
 
 	HttpConfig *HttpServerConfig
 
 	IdpManagerConfig *idp.Config
 
 	DeviceAuthorizationFlow *DeviceAuthorizationFlow
+
+	PKCEAuthorizationFlow *PKCEAuthorizationFlow
+
+	StoreConfig StoreConfig
+
+	ReverseProxy ReverseProxy
+}
+
+// GetAuthAudiences returns the audience from the http config and device authorization flow config
+func (c Config) GetAuthAudiences() []string {
+	audiences := []string{c.HttpConfig.AuthAudience}
+
+	if c.HttpConfig.ExtraAuthAudience != "" {
+		audiences = append(audiences, c.HttpConfig.ExtraAuthAudience)
+	}
+
+	if c.DeviceAuthorizationFlow != nil && c.DeviceAuthorizationFlow.ProviderConfig.Audience != "" {
+		audiences = append(audiences, c.DeviceAuthorizationFlow.ProviderConfig.Audience)
+	}
+
+	return audiences
 }
 
 // TURNConfig is a config of the TURNCredentialsManager
@@ -45,6 +75,12 @@ type TURNConfig struct {
 	CredentialsTTL       util.Duration
 	Secret               string
 	Turns                []*Host
+}
+
+type Relay struct {
+	Addresses      []string
+	CredentialsTTL util.Duration
+	Secret         string
 }
 
 // HttpServerConfig is a config of the HTTP Management service server
@@ -64,6 +100,10 @@ type HttpServerConfig struct {
 	AuthKeysLocation string
 	// OIDCConfigEndpoint is the endpoint of an IDP manager to get OIDC configuration
 	OIDCConfigEndpoint string
+	// IdpSignKeyRefreshEnabled identifies the signing key is currently being rotated or not
+	IdpSignKeyRefreshEnabled bool
+	// Extra audience
+	ExtraAuthAudience string
 }
 
 // Host represents a Wiretrustee host (e.g. STUN, TURN, Signal)
@@ -83,7 +123,14 @@ type DeviceAuthorizationFlow struct {
 	ProviderConfig ProviderConfig
 }
 
-// ProviderConfig has all attributes needed to initiate a device authorization flow
+// PKCEAuthorizationFlow represents Authorization Code Flow information
+// that can be used by the client to login initiate a Oauth 2.0 authorization code grant flow
+// with Proof Key for Code Exchange (PKCE). See https://datatracker.ietf.org/doc/html/rfc7636
+type PKCEAuthorizationFlow struct {
+	ProviderConfig ProviderConfig
+}
+
+// ProviderConfig has all attributes needed to initiate a device/pkce authorization flow
 type ProviderConfig struct {
 	// ClientID An IDP application client id
 	ClientID string
@@ -98,6 +145,40 @@ type ProviderConfig struct {
 	TokenEndpoint string
 	// DeviceAuthEndpoint is the endpoint of an IDP manager where clients can obtain device authorization code
 	DeviceAuthEndpoint string
+	// AuthorizationEndpoint is the endpoint of an IDP manager where clients can obtain authorization code
+	AuthorizationEndpoint string
+	// Scopes provides the scopes to be included in the token request
+	Scope string
+	// UseIDToken indicates if the id token should be used for authentication
+	UseIDToken bool
+	// RedirectURL handles authorization code from IDP manager
+	RedirectURLs []string
+}
+
+// StoreConfig contains Store configuration
+type StoreConfig struct {
+	Engine store.Engine
+}
+
+// ReverseProxy contains reverse proxy configuration in front of management.
+type ReverseProxy struct {
+	// TrustedHTTPProxies represents a list of trusted HTTP proxies by their IP prefixes.
+	// When extracting the real IP address from request headers, the middleware will verify
+	// if the peer's address falls within one of these trusted IP prefixes.
+	TrustedHTTPProxies []netip.Prefix
+
+	// TrustedHTTPProxiesCount specifies the count of trusted HTTP proxies between the internet
+	// and the server. When using the trusted proxy count method to extract the real IP address,
+	// the middleware will search the X-Forwarded-For IP list from the rightmost by this count
+	// minus one.
+	TrustedHTTPProxiesCount uint
+
+	// TrustedPeers represents a list of trusted peers by their IP prefixes.
+	// These peers are considered trustworthy by the gRPC server operator,
+	// and the middleware will attempt to extract the real IP address from
+	// request headers if the peer's address falls within one of these
+	// trusted IP prefixes.
+	TrustedPeers []netip.Prefix
 }
 
 // validateURL validates input http url
