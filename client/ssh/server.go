@@ -2,9 +2,6 @@ package ssh
 
 import (
 	"fmt"
-	"github.com/creack/pty"
-	"github.com/gliderlabs/ssh"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"net"
 	"os"
@@ -13,10 +10,21 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/creack/pty"
+	"github.com/gliderlabs/ssh"
+	log "github.com/sirupsen/logrus"
 )
 
 // DefaultSSHPort is the default SSH port of the NetBird's embedded SSH server
 const DefaultSSHPort = 44338
+
+// TerminalTimeout is the timeout for terminal session to be ready
+const TerminalTimeout = 10 * time.Second
+
+// TerminalBackoffDelay is the delay between terminal session readiness checks
+const TerminalBackoffDelay = 500 * time.Millisecond
 
 // DefaultSSHServer is a function that creates DefaultServer
 func DefaultSSHServer(hostKeyPEM []byte, addr string) (Server, error) {
@@ -110,9 +118,9 @@ func (srv *DefaultServer) publicKeyHandler(ctx ssh.Context, key ssh.PublicKey) b
 
 func prepareUserEnv(user *user.User, shell string) []string {
 	return []string{
-		fmt.Sprintf("SHELL=" + shell),
-		fmt.Sprintf("USER=" + user.Username),
-		fmt.Sprintf("HOME=" + user.HomeDir),
+		fmt.Sprint("SHELL=" + shell),
+		fmt.Sprint("USER=" + user.Username),
+		fmt.Sprint("HOME=" + user.HomeDir),
 	}
 }
 
@@ -137,6 +145,8 @@ func (srv *DefaultServer) sessionHandler(session ssh.Session) {
 		}
 	}()
 
+	log.Infof("Establishing SSH session for %s from host %s", session.User(), session.RemoteAddr().String())
+
 	localUser, err := userNameLookup(session.User())
 	if err != nil {
 		_, err = fmt.Fprintf(session, "remote SSH server couldn't find local user %s\n", session.User()) //nolint
@@ -158,8 +168,12 @@ func (srv *DefaultServer) sessionHandler(session ssh.Session) {
 		cmd := exec.Command(loginCmd, loginArgs...)
 		go func() {
 			<-session.Context().Done()
+			if cmd.Process == nil {
+				return
+			}
 			err := cmd.Process.Kill()
 			if err != nil {
+				log.Debugf("failed killing SSH process %v", err)
 				return
 			}
 		}()
@@ -172,9 +186,10 @@ func (srv *DefaultServer) sessionHandler(session ssh.Session) {
 			}
 		}
 
+		log.Debugf("Login command: %s", cmd.String())
 		file, err := pty.Start(cmd)
 		if err != nil {
-			log.Errorf("failed starting SSH server %v", err)
+			log.Errorf("failed starting SSH server: %v", err)
 		}
 
 		go func() {
@@ -199,6 +214,7 @@ func (srv *DefaultServer) sessionHandler(session ssh.Session) {
 			return
 		}
 	}
+	log.Debugf("SSH session ended")
 }
 
 func (srv *DefaultServer) stdInOut(file *os.File, session ssh.Session) {
@@ -206,17 +222,29 @@ func (srv *DefaultServer) stdInOut(file *os.File, session ssh.Session) {
 		// stdin
 		_, err := io.Copy(file, session)
 		if err != nil {
+			_ = session.Exit(1)
 			return
 		}
 	}()
 
-	go func() {
-		// stdout
-		_, err := io.Copy(session, file)
-		if err != nil {
+	// AWS Linux 2 machines need some time to open the terminal so we need to wait for it
+	timer := time.NewTimer(TerminalTimeout)
+	for {
+		select {
+		case <-timer.C:
+			_, _ = session.Write([]byte("Reached timeout while opening connection\n"))
+			_ = session.Exit(1)
 			return
+		default:
+			// stdout
+			writtenBytes, err := io.Copy(session, file)
+			if err != nil && writtenBytes != 0 {
+				_ = session.Exit(0)
+				return
+			}
+			time.Sleep(TerminalBackoffDelay)
 		}
-	}()
+	}
 }
 
 // Start starts SSH server. Blocking

@@ -3,6 +3,10 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"reflect"
+
 	"github.com/gorilla/mux"
 	prometheus2 "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -10,21 +14,21 @@ import (
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	metric2 "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/sdk/metric"
-	"net"
-	"net/http"
-	"reflect"
 )
 
 const defaultEndpoint = "/metrics"
 
 // MockAppMetrics mocks the AppMetrics interface
 type MockAppMetrics struct {
-	GetMeterFunc       func() metric2.Meter
-	CloseFunc          func() error
-	ExposeFunc         func(port int, endpoint string) error
-	IDPMetricsFunc     func() *IDPMetrics
-	HTTPMiddlewareFunc func() *HTTPMiddleware
-	GRPCMetricsFunc    func() *GRPCMetrics
+	GetMeterFunc                 func() metric2.Meter
+	CloseFunc                    func() error
+	ExposeFunc                   func(ctx context.Context, port int, endpoint string) error
+	IDPMetricsFunc               func() *IDPMetrics
+	HTTPMiddlewareFunc           func() *HTTPMiddleware
+	GRPCMetricsFunc              func() *GRPCMetrics
+	StoreMetricsFunc             func() *StoreMetrics
+	UpdateChannelMetricsFunc     func() *UpdateChannelMetrics
+	AddAccountManagerMetricsFunc func() *AccountManagerMetrics
 }
 
 // GetMeter mocks the GetMeter function of the AppMetrics interface
@@ -44,9 +48,9 @@ func (mock *MockAppMetrics) Close() error {
 }
 
 // Expose mocks the Expose function of the AppMetrics interface
-func (mock *MockAppMetrics) Expose(port int, endpoint string) error {
+func (mock *MockAppMetrics) Expose(ctx context.Context, port int, endpoint string) error {
 	if mock.ExposeFunc != nil {
-		return mock.ExposeFunc(port, endpoint)
+		return mock.ExposeFunc(ctx, port, endpoint)
 	}
 	return fmt.Errorf("unimplemented")
 }
@@ -75,25 +79,55 @@ func (mock *MockAppMetrics) GRPCMetrics() *GRPCMetrics {
 	return nil
 }
 
+// StoreMetrics mocks the MockAppMetrics function of the StoreMetrics interface
+func (mock *MockAppMetrics) StoreMetrics() *StoreMetrics {
+	if mock.StoreMetricsFunc != nil {
+		return mock.StoreMetricsFunc()
+	}
+	return nil
+}
+
+// UpdateChannelMetrics mocks the MockAppMetrics function of the UpdateChannelMetrics interface
+func (mock *MockAppMetrics) UpdateChannelMetrics() *UpdateChannelMetrics {
+	if mock.UpdateChannelMetricsFunc != nil {
+		return mock.UpdateChannelMetricsFunc()
+	}
+	return nil
+}
+
+// AccountManagerMetrics mocks the MockAppMetrics function of the AccountManagerMetrics interface
+func (mock *MockAppMetrics) AccountManagerMetrics() *AccountManagerMetrics {
+	if mock.AddAccountManagerMetricsFunc != nil {
+		return mock.AddAccountManagerMetricsFunc()
+	}
+	return nil
+}
+
 // AppMetrics is metrics interface
 type AppMetrics interface {
 	GetMeter() metric2.Meter
 	Close() error
-	Expose(port int, endpoint string) error
+	Expose(ctx context.Context, port int, endpoint string) error
 	IDPMetrics() *IDPMetrics
 	HTTPMiddleware() *HTTPMiddleware
 	GRPCMetrics() *GRPCMetrics
+	StoreMetrics() *StoreMetrics
+	UpdateChannelMetrics() *UpdateChannelMetrics
+	AccountManagerMetrics() *AccountManagerMetrics
 }
 
 // defaultAppMetrics are core application metrics based on OpenTelemetry https://opentelemetry.io/
 type defaultAppMetrics struct {
 	// Meter can be used by different application parts to create counters and measure things
-	Meter          metric2.Meter
-	listener       net.Listener
-	ctx            context.Context
-	idpMetrics     *IDPMetrics
-	httpMiddleware *HTTPMiddleware
-	grpcMetrics    *GRPCMetrics
+	Meter                 metric2.Meter
+	listener              net.Listener
+	ctx                   context.Context
+	idpMetrics            *IDPMetrics
+	httpMiddleware        *HTTPMiddleware
+	grpcMetrics           *GRPCMetrics
+	storeMetrics          *StoreMetrics
+	updateChannelMetrics  *UpdateChannelMetrics
+	accountManagerMetrics *AccountManagerMetrics
 }
 
 // IDPMetrics returns metrics for the idp package
@@ -111,6 +145,21 @@ func (appMetrics *defaultAppMetrics) GRPCMetrics() *GRPCMetrics {
 	return appMetrics.grpcMetrics
 }
 
+// StoreMetrics returns metrics for the store
+func (appMetrics *defaultAppMetrics) StoreMetrics() *StoreMetrics {
+	return appMetrics.storeMetrics
+}
+
+// UpdateChannelMetrics returns metrics for the updatechannel
+func (appMetrics *defaultAppMetrics) UpdateChannelMetrics() *UpdateChannelMetrics {
+	return appMetrics.updateChannelMetrics
+}
+
+// AccountManagerMetrics returns metrics for the account manager
+func (appMetrics *defaultAppMetrics) AccountManagerMetrics() *AccountManagerMetrics {
+	return appMetrics.accountManagerMetrics
+}
+
 // Close stop application metrics HTTP handler and closes listener.
 func (appMetrics *defaultAppMetrics) Close() error {
 	if appMetrics.listener == nil {
@@ -121,7 +170,7 @@ func (appMetrics *defaultAppMetrics) Close() error {
 
 // Expose metrics on a given port and endpoint. If endpoint is empty a defaultEndpoint one will be used.
 // Exposes metrics in the Prometheus format https://prometheus.io/
-func (appMetrics *defaultAppMetrics) Expose(port int, endpoint string) error {
+func (appMetrics *defaultAppMetrics) Expose(ctx context.Context, port int, endpoint string) error {
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}
@@ -141,7 +190,7 @@ func (appMetrics *defaultAppMetrics) Expose(port int, endpoint string) error {
 		}
 	}()
 
-	log.Infof("enabled application metrics and exposing on http://%s", listener.Addr().String())
+	log.WithContext(ctx).Infof("enabled application metrics and exposing on http://%s", listener.Addr().String())
 
 	return nil
 }
@@ -171,11 +220,35 @@ func NewDefaultAppMetrics(ctx context.Context) (AppMetrics, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	grpcMetrics, err := NewGRPCMetrics(ctx, meter)
 	if err != nil {
 		return nil, err
 	}
 
-	return &defaultAppMetrics{Meter: meter, ctx: ctx, idpMetrics: idpMetrics, httpMiddleware: middleware,
-		grpcMetrics: grpcMetrics}, nil
+	storeMetrics, err := NewStoreMetrics(ctx, meter)
+	if err != nil {
+		return nil, err
+	}
+
+	updateChannelMetrics, err := NewUpdateChannelMetrics(ctx, meter)
+	if err != nil {
+		return nil, err
+	}
+
+	accountManagerMetrics, err := NewAccountManagerMetrics(ctx, meter)
+	if err != nil {
+		return nil, err
+	}
+
+	return &defaultAppMetrics{
+		Meter:                 meter,
+		ctx:                   ctx,
+		idpMetrics:            idpMetrics,
+		httpMiddleware:        middleware,
+		grpcMetrics:           grpcMetrics,
+		storeMetrics:          storeMetrics,
+		updateChannelMetrics:  updateChannelMetrics,
+		accountManagerMetrics: accountManagerMetrics,
+	}, nil
 }
