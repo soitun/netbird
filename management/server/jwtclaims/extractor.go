@@ -2,19 +2,31 @@ package jwtclaims
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/golang-jwt/jwt"
 )
 
 const (
-	TokenUserProperty    = "user"
-	AccountIDSuffix      = "wt_account_id"
-	DomainIDSuffix       = "wt_account_domain"
+	// TokenUserProperty key for the user property in the request context
+	TokenUserProperty = "user"
+	// AccountIDSuffix suffix for the account id claim
+	AccountIDSuffix = "wt_account_id"
+	// DomainIDSuffix suffix for the domain id claim
+	DomainIDSuffix = "wt_account_domain"
+	// DomainCategorySuffix suffix for the domain category claim
 	DomainCategorySuffix = "wt_account_domain_category"
-	UserIDClaim          = "sub"
+	// UserIDClaim claim for the user id
+	UserIDClaim = "sub"
+	// LastLoginSuffix claim for the last login
+	LastLoginSuffix = "nb_last_login"
+	// Invited claim indicates that an incoming JWT is from a user that just accepted an invitation
+	Invited = "nb_invited"
+	// IsToken claim indicates that auth type from the user is a token
+	IsToken = "is_token"
 )
 
-// Extract function type
+// ExtractClaims Extract function type
 type ExtractClaims func(r *http.Request) AuthorizationClaims
 
 // ClaimsExtractor struct that holds the extract function
@@ -68,7 +80,9 @@ func NewClaimsExtractor(options ...ClaimsExtractorOption) *ClaimsExtractor {
 // FromToken extracts claims from the token (after auth)
 func (c *ClaimsExtractor) FromToken(token *jwt.Token) AuthorizationClaims {
 	claims := token.Claims.(jwt.MapClaims)
-	jwtClaims := AuthorizationClaims{}
+	jwtClaims := AuthorizationClaims{
+		Raw: claims,
+	}
 	userID, ok := claims[c.userIDClaim].(string)
 	if !ok {
 		return jwtClaims
@@ -86,7 +100,26 @@ func (c *ClaimsExtractor) FromToken(token *jwt.Token) AuthorizationClaims {
 	if ok {
 		jwtClaims.DomainCategory = domainCategoryClaim.(string)
 	}
+	LastLoginClaimString, ok := claims[c.authAudience+LastLoginSuffix]
+	if ok {
+		jwtClaims.LastLogin = parseTime(LastLoginClaimString.(string))
+	}
+	invitedBool, ok := claims[c.authAudience+Invited]
+	if ok {
+		jwtClaims.Invited = invitedBool.(bool)
+	}
 	return jwtClaims
+}
+
+func parseTime(timeString string) time.Time {
+	if timeString == "" {
+		return time.Time{}
+	}
+	parsedTime, err := time.Parse(time.RFC3339, timeString)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsedTime
 }
 
 // fromRequestContext extracts claims from the request context previously filled by the JWT token (after auth)
