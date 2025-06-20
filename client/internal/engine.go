@@ -1082,7 +1082,7 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 
 	// must set the exclude list after the peers are added. Without it the manager can not figure out the peers parameters from the store
 	excludedLazyPeers := e.toExcludedLazyPeers(forwardingRules, networkMap.GetRemotePeers())
-	e.connMgr.SetExcludeList(excludedLazyPeers)
+	e.connMgr.SetExcludeList(e.ctx, excludedLazyPeers)
 
 	e.networkSerial = serial
 
@@ -1527,6 +1527,7 @@ func (e *Engine) newWgIface() (*iface.WGIface, error) {
 		MTU:          iface.DefaultMTU,
 		TransportNet: transportNet,
 		FilterFn:     e.addrViaRoutes,
+		DisableDNS:   e.config.DisableDNS,
 	}
 
 	switch runtime.GOOS {

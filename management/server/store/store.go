@@ -72,6 +72,7 @@ type Store interface {
 	DeleteAccount(ctx context.Context, account *types.Account) error
 	UpdateAccountDomainAttributes(ctx context.Context, accountID string, domain string, category string, isPrimaryDomain bool) error
 	SaveDNSSettings(ctx context.Context, lockStrength LockingStrength, accountID string, settings *types.DNSSettings) error
+	SaveAccountSettings(ctx context.Context, lockStrength LockingStrength, accountID string, settings *types.Settings) error
 	CountAccountsByPrivateDomain(ctx context.Context, domain string) (int64, error)
 
 	GetUserByPATID(ctx context.Context, lockStrength LockingStrength, patID string) (*types.User, error)
@@ -144,7 +145,9 @@ type Store interface {
 	DeleteSetupKey(ctx context.Context, lockStrength LockingStrength, accountID, keyID string) error
 
 	GetAccountRoutes(ctx context.Context, lockStrength LockingStrength, accountID string) ([]*route.Route, error)
-	GetRouteByID(ctx context.Context, lockStrength LockingStrength, routeID string, accountID string) (*route.Route, error)
+	GetRouteByID(ctx context.Context, lockStrength LockingStrength, accountID, routeID string) (*route.Route, error)
+	SaveRoute(ctx context.Context, lockStrength LockingStrength, route *route.Route) error
+	DeleteRoute(ctx context.Context, lockStrength LockingStrength, accountID, routeID string) error
 
 	GetAccountNameServerGroups(ctx context.Context, lockStrength LockingStrength, accountID string) ([]*dns.NameServerGroup, error)
 	GetNameServerGroupByID(ctx context.Context, lockStrength LockingStrength, nameServerGroupID string, accountID string) (*dns.NameServerGroup, error)
