@@ -12,6 +12,8 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/systray"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/version"
 )
 
 type eventHandler struct {
@@ -120,7 +122,7 @@ func (h *eventHandler) handleAdvancedSettingsClick() {
 	go func() {
 		defer h.client.mAdvancedSettings.Enable()
 		defer h.client.getSrvConfig()
-		h.runSelfCommand("settings", "true")
+		h.runSelfCommand(h.client.ctx, "settings", "true")
 	}()
 }
 
@@ -128,7 +130,7 @@ func (h *eventHandler) handleCreateDebugBundleClick() {
 	h.client.mCreateDebugBundle.Disable()
 	go func() {
 		defer h.client.mCreateDebugBundle.Enable()
-		h.runSelfCommand("debug", "true")
+		h.runSelfCommand(h.client.ctx, "debug", "true")
 	}()
 }
 
@@ -143,7 +145,7 @@ func (h *eventHandler) handleGitHubClick() {
 }
 
 func (h *eventHandler) handleUpdateClick() {
-	if err := openURL("https://netbird.io/download"); err != nil {
+	if err := openURL(version.DownloadUrl()); err != nil {
 		log.Errorf("failed to open download URL: %v", err)
 	}
 }
@@ -152,7 +154,7 @@ func (h *eventHandler) handleNetworksClick() {
 	h.client.mNetworks.Disable()
 	go func() {
 		defer h.client.mNetworks.Enable()
-		h.runSelfCommand("networks", "true")
+		h.runSelfCommand(h.client.ctx, "networks", "true")
 	}()
 }
 
@@ -170,14 +172,14 @@ func (h *eventHandler) updateConfigWithErr() {
 	}
 }
 
-func (h *eventHandler) runSelfCommand(command, arg string) {
+func (h *eventHandler) runSelfCommand(ctx context.Context, command, arg string) {
 	proc, err := os.Executable()
 	if err != nil {
 		log.Errorf("error getting executable path: %v", err)
 		return
 	}
 
-	cmd := exec.Command(proc,
+	cmd := exec.CommandContext(ctx, proc,
 		fmt.Sprintf("--%s=%s", command, arg),
 		fmt.Sprintf("--daemon-addr=%s", h.client.addr),
 	)

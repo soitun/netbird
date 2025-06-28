@@ -92,7 +92,7 @@ func (am *DefaultAccountManager) getUserAccessiblePeers(ctx context.Context, acc
 
 	// fetch all the peers that have access to the user's peers
 	for _, peer := range peers {
-		aclPeers, _ := account.GetPeerConnectionResources(ctx, peer.ID, approvedPeersMap)
+		aclPeers, _ := account.GetPeerConnectionResources(ctx, peer, approvedPeersMap)
 		for _, p := range aclPeers {
 			peersMap[p.ID] = p
 		}
@@ -133,7 +133,7 @@ func (am *DefaultAccountManager) MarkPeerConnected(ctx context.Context, peerPubK
 		}
 
 		if peer.LoginExpirationEnabled && settings.PeerLoginExpirationEnabled {
-			am.checkAndSchedulePeerLoginExpiration(ctx, accountID)
+			am.schedulePeerLoginExpiration(ctx, accountID)
 		}
 
 		if peer.InactivityExpirationEnabled && settings.PeerInactivityExpirationEnabled {
@@ -296,7 +296,8 @@ func (am *DefaultAccountManager) UpdatePeer(ctx context.Context, accountID, user
 		am.StoreEvent(ctx, userID, peer.IP.String(), accountID, event, peer.EventMeta(dnsDomain))
 
 		if peer.AddedWithSSOLogin() && peer.LoginExpirationEnabled && settings.PeerLoginExpirationEnabled {
-			am.checkAndSchedulePeerLoginExpiration(ctx, accountID)
+			am.peerLoginExpiry.Cancel(ctx, []string{accountID})
+			am.schedulePeerLoginExpiration(ctx, accountID)
 		}
 	}
 
@@ -1148,7 +1149,7 @@ func (am *DefaultAccountManager) checkIfUserOwnsPeer(ctx context.Context, accoun
 	}
 
 	for _, p := range userPeers {
-		aclPeers, _ := account.GetPeerConnectionResources(ctx, p.ID, approvedPeersMap)
+		aclPeers, _ := account.GetPeerConnectionResources(ctx, p, approvedPeersMap)
 		for _, aclPeer := range aclPeers {
 			if aclPeer.ID == peer.ID {
 				return peer, nil
@@ -1168,7 +1169,7 @@ func (am *DefaultAccountManager) UpdateAccountPeers(ctx context.Context, account
 		return
 	}
 
-	start := time.Now()
+	globalStart := time.Now()
 
 	approvedPeersMap, err := am.integratedPeerValidator.GetValidatedPeers(account.Id, maps.Values(account.Groups), maps.Values(account.Peers), account.Settings.Extra)
 	if err != nil {
@@ -1203,18 +1204,27 @@ func (am *DefaultAccountManager) UpdateAccountPeers(ctx context.Context, account
 			defer wg.Done()
 			defer func() { <-semaphore }()
 
+			start := time.Now()
+
 			postureChecks, err := am.getPeerPostureChecks(account, p.ID)
 			if err != nil {
 				log.WithContext(ctx).Debugf("failed to get posture checks for peer %s: %v", peer.ID, err)
 				return
 			}
 
+			am.metrics.UpdateChannelMetrics().CountCalcPostureChecksDuration(time.Since(start))
+			start = time.Now()
+
 			remotePeerNetworkMap := account.GetPeerNetworkMap(ctx, p.ID, customZone, approvedPeersMap, resourcePolicies, routers, am.metrics.AccountManagerMetrics())
+
+			am.metrics.UpdateChannelMetrics().CountCalcPeerNetworkMapDuration(time.Since(start))
+			start = time.Now()
 
 			proxyNetworkMap, ok := proxyNetworkMaps[p.ID]
 			if ok {
 				remotePeerNetworkMap.Merge(proxyNetworkMap)
 			}
+			am.metrics.UpdateChannelMetrics().CountMergeNetworkMapDuration(time.Since(start))
 
 			extraSetting, err := am.settingsManager.GetExtraSettings(ctx, accountID)
 			if err != nil {
@@ -1222,7 +1232,10 @@ func (am *DefaultAccountManager) UpdateAccountPeers(ctx context.Context, account
 				return
 			}
 
+			start = time.Now()
 			update := toSyncResponse(ctx, nil, p, nil, nil, remotePeerNetworkMap, dnsDomain, postureChecks, dnsCache, account.Settings, extraSetting)
+			am.metrics.UpdateChannelMetrics().CountToSyncResponseDuration(time.Since(start))
+
 			am.peersUpdateManager.SendUpdate(ctx, p.ID, &UpdateMessage{Update: update, NetworkMap: remotePeerNetworkMap})
 		}(peer)
 	}
@@ -1231,7 +1244,7 @@ func (am *DefaultAccountManager) UpdateAccountPeers(ctx context.Context, account
 
 	wg.Wait()
 	if am.metrics != nil {
-		am.metrics.AccountManagerMetrics().CountUpdateAccountPeersDuration(time.Since(start))
+		am.metrics.AccountManagerMetrics().CountUpdateAccountPeersDuration(time.Since(globalStart))
 	}
 }
 
